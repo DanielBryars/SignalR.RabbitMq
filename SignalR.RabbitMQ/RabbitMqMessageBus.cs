@@ -1,30 +1,38 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 
 namespace SignalR.RabbitMQ
 {
-    public class RabbitMqMessageBus : IMessageBus, IIdGenerator<long>
+    public class RabbitMqMessageBus : IMessageBus, IIdGenerator<long>, IDisposable
     {
+        private readonly TimeSpan _rabbitConnectionRetryPeriod = TimeSpan.FromMilliseconds(200);
         private readonly InProcessMessageBus<long> _bus;
-        private readonly IModel _rabbitmqchannel;
         private readonly string _rabbitmqExchangeName;
-        private int _resource = 0;
+        private readonly ConnectionFactory _connectionFactory;
+
+        private readonly Object _modelAccessSerializationLock = new Object(); //Models can only be accessed one thread at a time.
+        private IModel _model; //We cache the model.
+
         private int _count;
 
-        public RabbitMqMessageBus(IDependencyResolver resolver, string rabbitMqExchangeName, IModel rabbitMqChannel)
+        private Boolean _isDisposed = false;
+
+        public RabbitMqMessageBus(IDependencyResolver resolver, string rabbitMqExchangeName, ConnectionFactory connectionFactory)
         {
             _bus = new InProcessMessageBus<long>(resolver, this);
-            _rabbitmqchannel = rabbitMqChannel;
             _rabbitmqExchangeName = rabbitMqExchangeName;
+            _connectionFactory = connectionFactory;
 
-            EnsureConnection();
+            ListenForMessages();
         }
 
         public Task<MessageResult> GetMessages(IEnumerable<string> eventKeys, string id, CancellationToken timeoutToken)
@@ -55,48 +63,162 @@ namespace SignalR.RabbitMQ
 
         private void SendMessage(object state)
         {
-            var message = (RabbitMqMessageWrapper) state;
-            byte[] payload = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(message));
-            _rabbitmqchannel.BasicPublish(_rabbitmqExchangeName, message.EventKey, null, payload);
+            Boolean sent = false;
+            while (GetIsAlive() && !sent)
+            {
+                try
+                {
+                    IModel model = GetExistingOrCreateNewModel();
+
+                    var message = (RabbitMqMessageWrapper)state;
+                    byte[] payload = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(message));
+
+                    //The model can be accessed from different threads, but NOT overlapped.
+                    lock (_modelAccessSerializationLock)
+                    {
+                        model.BasicPublish(_rabbitmqExchangeName, message.EventKey, null, payload);
+                    }
+
+                    sent = true;
+                }
+                catch (IOException)
+                {
+                    /*SWALLOW*/
+                    DestroyModel();
+                    Thread.Sleep(_rabbitConnectionRetryPeriod);
+                }
+                catch (OperationInterruptedException)
+                {
+                    /*SWALLOW*/
+                    DestroyModel();
+                    Thread.Sleep(_rabbitConnectionRetryPeriod);
+                }
+            } 
         }
 
-        private void EnsureConnection()
+        private IModel GetExistingOrCreateNewModel()
         {
-            var tcs = new TaskCompletionSource<Object>();
+            lock (_modelAccessSerializationLock)
+            {
+                IModel model = _model;
 
-            if (1 == Interlocked.Exchange(ref _resource, 1))
+                if (model == null)
+                {
+                    global::RabbitMQ.Client.IConnection connection = _connectionFactory.CreateConnection();
+                    model = connection.CreateModel();
+                    _model = model;
+
+                    connection.AutoClose = true;
+                }
+
+                return model;
+            }
+        }
+
+        private Boolean GetIsAlive()
+        {
+            return !_isDisposed && !System.Environment.HasShutdownStarted;
+        }
+
+        /// <summary>
+        /// Doesn't throw
+        /// </summary>
+        private void DestroyModel()
+        {
+            IModel model;
+
+            lock (_modelAccessSerializationLock)
+            {
+                model = _model;
+                _model = null;
+            }
+
+            if (model != null)
+            {
+                try
+                {
+                    model.Close();
+                    model.Dispose();
+                }
+                catch {/*SWALLOW*/}
+            }
+        }
+
+        private void ListenForMessages()
+        {            
+            ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    while (GetIsAlive())
+                    {
+                        try
+                        {
+                            QueueingBasicConsumer consumer;
+
+                            IModel model = GetExistingOrCreateNewModel();
+
+                            lock (_modelAccessSerializationLock)
+                            {
+                                var queue = model.QueueDeclare("", false, false, true, null);
+
+                                model.QueueBind(queue.QueueName, _rabbitmqExchangeName, "#");
+
+                                consumer = new QueueingBasicConsumer(model);
+                                model.BasicConsume(queue.QueueName, false, consumer);
+                            }
+
+                            while (GetIsAlive())
+                            {
+                                BasicDeliverEventArgs ea = null;
+                                Object dequeuedMessage;
+
+                                //Peep at "GetIsAlive()" every 500 ms to support cancelling on Dispose.
+                                Boolean messageReceived = consumer.Queue.Dequeue(500, out dequeuedMessage);
+                                if (messageReceived)
+                                {
+                                    ea = (BasicDeliverEventArgs)dequeuedMessage;
+                                }
+                                else
+                                {
+                                    //We timed out waiting for the message
+                                    continue;
+                                }
+
+                                lock (_modelAccessSerializationLock)
+                                {
+                                    model.BasicAck(ea.DeliveryTag, false);
+                                }
+
+                                string json = Encoding.UTF8.GetString(ea.Body);
+
+                                var message = JsonConvert.DeserializeObject<RabbitMqMessageWrapper>(json);
+                                _bus.Send(message.ConnectionIdentifier, message.EventKey, message.Value);
+                            }
+                        }
+                        catch (IOException)
+                        {
+                            /*SWALLOW*/
+                            DestroyModel();
+                            Thread.Sleep(_rabbitConnectionRetryPeriod);
+                        }
+                        catch (OperationInterruptedException)
+                        {
+                            /*SWALLOW*/
+                            DestroyModel();
+                            Thread.Sleep(_rabbitConnectionRetryPeriod);
+                        }
+                    }
+                });
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed)
             {
                 return;
             }
+            _isDisposed = true;
 
-            ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    try
-                    {
-
-                        var queue = _rabbitmqchannel.QueueDeclare("", false, false, true, null);
-                        _rabbitmqchannel.QueueBind(queue.QueueName, _rabbitmqExchangeName, "#");
-
-                        var consumer = new QueueingBasicConsumer(_rabbitmqchannel);
-                        _rabbitmqchannel.BasicConsume(queue.QueueName, false, consumer);
-
-                        while (true)
-                        {
-                            var ea = (BasicDeliverEventArgs) consumer.Queue.Dequeue();
-
-                            _rabbitmqchannel.BasicAck(ea.DeliveryTag, false);
-
-                            string json = Encoding.UTF8.GetString(ea.Body);
-                                                  
-                            var message = JsonConvert.DeserializeObject<RabbitMqMessageWrapper>(json);
-                            _bus.Send(message.ConnectionIdentifier, message.EventKey, message.Value);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        tcs.SetException(ex);
-                    }
-                });
+            DestroyModel();
         }
     }
 }
