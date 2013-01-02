@@ -106,9 +106,12 @@ namespace SignalR.RabbitMQ
                 {
                     global::RabbitMQ.Client.IConnection connection = _connectionFactory.CreateConnection();
                     model = connection.CreateModel();
+                    connection.AutoClose = true;
+
                     _model = model;
 
-                    connection.AutoClose = true;
+                    //Ensure the Exchange is declared.
+                    model.ExchangeDeclare(_rabbitmqExchangeName, "topic", true);                    
                 }
 
                 return model;
